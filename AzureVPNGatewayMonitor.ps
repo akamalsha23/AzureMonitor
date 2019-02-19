@@ -1,0 +1,72 @@
+$connectionName = "<Azure Run As Connection Name>"
+$subscriptionId = "<subscription id>"
+$region = "<NwWatcher Region>"
+$vpnConnectionName = "<VPN Connection Name"
+$vpnConnectionResourceGroup = "<VPN Connection resource group name>"
+$storageAccountName = "<Storage Account Name>"
+$storageAccountResourceGroup = "<Storage Account Resource roup name>"
+$storageAccountContainer = "<Storage Account Container Name>"
+$FunctionAppResourceGroup = "<Function App Resource Group Name>"
+$FunctionAppName = "<Name of Function App>"
+
+# Get the connection "AzureRunAsConnection"
+$servicePrincipalConnection = Get-AutomationConnection -Name $connectionName
+
+"Logging in to Azure..."
+Connect-AzureRmAccount `
+    -ServicePrincipal `
+    -TenantId $servicePrincipalConnection.TenantId `
+    -ApplicationId $servicePrincipalConnection.ApplicationId `
+    -CertificateThumbprint $servicePrincipalConnection.CertificateThumbprint
+    
+"Setting context to a specific subscription"
+Set-AzureRmContext -SubscriptionId $subscriptionId
+
+Register-AzureRmResourceProvider -ProviderNamespace "Microsoft.Network"
+$nw = Get-AzurermResource | Where {$_.ResourceType -eq "Microsoft.Network/networkWatchers"}
+$networkWatcher = Get-AzureRmNetworkWatcher -location $region
+$connection = Get-AzureRmVirtualNetworkGatewayConnection -Name $vpnConnectionName -ResourceGroupName $vpnConnectionResourceGroup
+$sa = Get-AzureRmStorageAccount -Name $storageAccountName -ResourceGroupName $storageAccountResourceGroup 
+
+#Set storage account context
+$ctx = $sa.Context 
+
+$storagePath = "$($sa.PrimaryEndpoints.Blob)$($storageAccountContainer)"
+
+#Start NW Watcher
+$result = Start-AzureRmNetworkWatcherResourceTroubleshooting -NetworkWatcher $networkWatcher -TargetResourceId $connection.Id -StorageId $sa.Id -StoragePath $storagePath
+
+#Create Temp object
+$vpn_result_object_temp = new-object PSObject
+$vpn_result_object_temp | add-member -membertype NoteProperty -name "Result Code" -Value $result.code
+$vpn_result_object_temp | add-member -membertype NoteProperty -name " Troubleshoot Start time" -Value $result.StartTime
+$vpn_result_object_temp | add-member -membertype NoteProperty -name " Troubleshoot End time" -Value $result.EndTime
+$vpn_result_object_temp | add-member -membertype NoteProperty -name " Result ID" -Value $result.results.ID
+$vpn_result_object_temp | add-member -membertype NoteProperty -name " Result Summary" -Value $result.results.Summary
+$vpn_result_object_temp | add-member -membertype NoteProperty -name " Result Detail" -Value $result.results.Detail
+$vpn_result_object += $vpn_result_object_temp
+
+#Convert to a string 
+$vpn_result_string = $vpn_result_object | Out-String -stream
+
+# Creating file path to store the result temporarily
+$file_path_for_result = $env:temp+"<\Filepath\FileName.txt>"
+
+#Write to Cloud drive on Azure CLI
+#$vpn_result_string | Out-File FileSystem::/home/adil/result.txt 
+
+#Write string result object to file
+$vpn_result_string | Out-File $file_path_for_result
+
+#Write file to Blob
+$Blob = Get-AzureStorageBlob -Context $ctx -Container $storageAccountContainer -Blob "<NewFileName.txt>" | Set-AzureStorageBlobContent -File $file_path_for_result -BlobType Append -Force
+
+if($result.code -ne "Healthy")
+    {
+        Write-Output ("Connection is unhealthy, Troubleshoot!") 
+        Invoke-AzureRmResourceAction -ResourceGroupName $FunctionAppResourceGroup -ResourceType Microsoft.Web/sites -ResourceName $FunctionAppName -Action start  -ApiVersion 2018-02-01 -Force 
+    }
+else
+    {
+    Write-Output ("Connection Status is: $($result.code)")
+    }
